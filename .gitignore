@@ -1,0 +1,13 @@
+*.pyc
+.DS_Store
+backup
+chroma
+__pycache__/
+*.env
+*.env.local
+.env.local
+node_modules/
+.next/
+.vercel/
+dist/
+build/
