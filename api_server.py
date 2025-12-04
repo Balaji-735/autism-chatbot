@@ -51,8 +51,15 @@ _baseline_metrics: Optional[BenchmarkMetrics] = None
 def get_db():
     global _db, _embedding_function
     if _db is None:
-        _embedding_function = get_embedding_function()
-        _db = Chroma(persist_directory=CHROMA_PATH, embedding_function=_embedding_function)
+        try:
+            _embedding_function = get_embedding_function()
+            _db = Chroma(persist_directory=CHROMA_PATH, embedding_function=_embedding_function)
+        except Exception as e:
+            # If embeddings fail, raise clear error
+            raise HTTPException(
+                status_code=503,
+                detail=f"Embedding service not available. Please ensure Ollama is running or set OLLAMA_BASE_URL. Error: {str(e)}"
+            )
     return _db
 
 
@@ -60,8 +67,17 @@ def get_model(model_name: Optional[str] = None):
     global _model, _model_name
     model_to_use = model_name or _model_name
     if _model is None or _model_name != model_to_use:
-        _model = OllamaLLM(model=model_to_use)
-        _model_name = model_to_use
+        try:
+            # Try to get Ollama base URL from environment
+            ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            _model = OllamaLLM(model=model_to_use, base_url=ollama_base_url)
+            _model_name = model_to_use
+        except Exception as e:
+            # If Ollama is not available, raise a clear error
+            raise HTTPException(
+                status_code=503,
+                detail=f"Ollama service not available. Please ensure Ollama is running at {ollama_base_url} or set OLLAMA_BASE_URL environment variable. Error: {str(e)}"
+            )
     return _model
 
 def reset_model():
@@ -129,14 +145,14 @@ def root():
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint."""
+    """Health check endpoint - simple check without requiring Ollama."""
     try:
-        db = get_db()
-        model = get_model()
+        # Just check if the app is running, don't initialize Ollama
+        # Ollama will be initialized lazily when needed
         return {
             "status": "healthy",
-            "database": "connected",
-            "model": "ready"
+            "service": "autism-chatbot-backend",
+            "version": "1.0.0"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Service unhealthy: {str(e)}")
