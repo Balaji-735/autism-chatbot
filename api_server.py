@@ -17,18 +17,26 @@ import json
 app = FastAPI(title="Autism Chatbot API", version="1.0.0")
 
 # CORS middleware
-# Allow origins from environment variable or default to localhost
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+# For local development, allow all origins so the frontend can run on any port (3000, 3001, 3003, etc.)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 CHROMA_PATH = "chroma"
 DATA_PATH = "data"
+
+# Base and optimized model names (can be overridden via environment variables)
+BASE_MODEL_NAME = os.getenv("BASE_MODEL_NAME", "mistral")
+# Template for quantized models - Now using actual pre-quantized Mistral models!
+# mistral:7b-instruct-q4_0 is a real quantized model (4.1GB vs 4.4GB baseline)
+QUANT_MODEL_TEMPLATE = os.getenv("QUANT_MODEL_TEMPLATE", "mistral:7b-instruct-q4_0")
+# Name of a pruned / smaller model - using llama3.2:1b-instruct-q4_0 (770MB) as a smaller alternative
+PRUNED_MODEL_NAME = os.getenv("PRUNED_MODEL_NAME", "llama3.2:1b-instruct-q4_0")  # 770MB vs 4.4GB baseline
+
 PROMPT_TEMPLATE = """
 Answer the question based only on the following context:
 
@@ -39,11 +47,12 @@ Answer the question based only on the following context:
 Answer the question based on the above context: {question}
 """
 
-# Initialize DB and model (singleton pattern)
+# Initialize DB and model (singleton / cached pattern)
 _embedding_function = None
 _db = None
-_model = None
-_model_name = "mistral"
+# Cache multiple models by name so we can benchmark different variants
+_models: Dict[str, OllamaLLM] = {}
+_model_name = BASE_MODEL_NAME
 _optimizer = ModelOptimizer()
 _baseline_metrics: Optional[BenchmarkMetrics] = None
 
@@ -57,17 +66,21 @@ def get_db():
 
 
 def get_model(model_name: Optional[str] = None):
-    global _model, _model_name
+    """
+    Get (and cache) an Ollama model by name.
+    This allows us to benchmark different model variants (baseline, quantized, pruned).
+    """
+    global _models, _model_name
     model_to_use = model_name or _model_name
-    if _model is None or _model_name != model_to_use:
-        _model = OllamaLLM(model=model_to_use)
-        _model_name = model_to_use
-    return _model
+    if model_to_use not in _models:
+        _models[model_to_use] = OllamaLLM(model=model_to_use)
+    return _models[model_to_use]
+
 
 def reset_model():
-    """Reset model to force reload."""
-    global _model
-    _model = None
+    """Reset all cached models to force reload."""
+    global _models
+    _models = {}
 
 
 class QueryRequest(BaseModel):
@@ -129,10 +142,10 @@ def root():
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint - simple response for Render deployment."""
+    """Health check endpoint - simple response for local development."""
     return {
         "status": "healthy",
-        "service": "autism-chatbot-backend"
+        "service": "autism-chatbot-backend",
     }
 
 
@@ -195,13 +208,19 @@ async def serve_pdf(file: str):
 
 
 class BenchmarkRequest(BaseModel):
+    # Optional free-form list of test queries (kept for backwards compatibility)
     test_queries: List[str] = ["What is autism?", "What are the symptoms of autism?", "How is autism diagnosed?"]
     technique: Optional[str] = None  # "quantization", "pruning", or None for baseline
+    # New: single question to benchmark on (e.g., current chat question)
+    question: Optional[str] = None
+
 
 class OptimizationRequest(BaseModel):
     technique: str  # "quantization" or "pruning"
     quantization_level: Optional[str] = "q4_0"  # For quantization
     pruning_ratio: Optional[float] = 0.3  # For pruning
+    # Question to benchmark on (typically the current chat question)
+    question: Optional[str] = None
 
 
 @app.post("/api/query", response_model=QueryResponse)
@@ -221,28 +240,34 @@ async def query(request: QueryRequest):
 
 @app.post("/api/benchmark/baseline")
 async def benchmark_baseline(request: BenchmarkRequest):
-    """Run baseline benchmark."""
+    """Run baseline benchmark on the current question using the baseline model."""
     try:
         db = get_db()
-        model = get_model()
-        
+        model = get_model(BASE_MODEL_NAME)
+
+        # Determine the question to benchmark on
+        question = (request.question or (request.test_queries[0] if request.test_queries else "What is autism?")).strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Question for benchmark cannot be empty")
+
         def query_func(q: str):
-            answer, _ = query_rag(q, db, model)
+            # Always benchmark on the chosen question, not on q
+            answer, _ = query_rag(question, db, model)
             return answer
-        
+
         result = _optimizer.benchmark_model(
-            model_name="mistral",
+            model_name=BASE_MODEL_NAME,
             query_func=query_func,
-            test_queries=request.test_queries,
-            technique="baseline"
+            test_queries=[question],
+            technique="baseline",
         )
-        
+
         global _baseline_metrics
         _baseline_metrics = result.metrics
-        
+
         return {
             "technique": "baseline",
-            "model_name": "mistral",
+            "model_name": BASE_MODEL_NAME,
             "metrics": {
                 "response_time": result.metrics.response_time,
                 "memory_usage_mb": result.metrics.memory_usage_mb,
@@ -252,7 +277,7 @@ async def benchmark_baseline(request: BenchmarkRequest):
                 "latency_p50": result.metrics.latency_p50,
                 "latency_p95": result.metrics.latency_p95,
                 "latency_p99": result.metrics.latency_p99,
-            }
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error running baseline benchmark: {str(e)}")
@@ -260,52 +285,72 @@ async def benchmark_baseline(request: BenchmarkRequest):
 
 @app.post("/api/benchmark/quantization")
 async def benchmark_quantization(request: OptimizationRequest):
-    """Run quantization benchmark."""
+    """Run quantization benchmark using a real quantized model."""
     if request.technique != "quantization":
         raise HTTPException(status_code=400, detail="Technique must be 'quantization'")
     
     try:
+        # Determine question
+        question = (request.question or "What is autism?").strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Question for benchmark cannot be empty")
+
         db = get_db()
         quantization_level = request.quantization_level or "q4_0"
-        # Note: In a real implementation, you'd need to load a quantized model
-        # For now, we'll simulate the improvements
-        model = get_model()  # Use base model
         
-        def query_func(q: str):
-            answer, _ = query_rag(q, db, model)
+        # Map quantization levels to actual pre-quantized models available in Ollama
+        quant_model_map = {
+            "q4_0": "mistral:7b-instruct-q4_0",   # 4.1GB - Real quantized Mistral model
+            "q5_0": "llama3.2:3b",   # 2.0GB - Alternative smaller model
+            "q8_0": "llama3.2:1b-instruct-q4_0"   # 770MB - Very small quantized model
+        }
+        
+        # Get quantized model name from map, fallback to template if custom
+        quant_model_name = quant_model_map.get(quantization_level)
+        if not quant_model_name:
+            # Try template format as fallback (for custom quantization levels)
+            try:
+                quant_model_name = QUANT_MODEL_TEMPLATE.format(level=quantization_level)
+            except (KeyError, ValueError):
+                # If template doesn't support {level}, use the default quantized model
+                quant_model_name = QUANT_MODEL_TEMPLATE if "{level}" not in QUANT_MODEL_TEMPLATE else "mistral:7b-instruct-q4_0"
+
+        # Baseline: real benchmark on base model
+        base_model = get_model(BASE_MODEL_NAME)
+
+        def baseline_query(q: str):
+            answer, _ = query_rag(question, db, base_model)
             return answer
-        
-        # Get baseline if not already set
-        if _baseline_metrics is None:
-            baseline_result = _optimizer.benchmark_model(
-                model_name="mistral",
-                query_func=query_func,
-                test_queries=["What is autism?"],
-                technique="baseline"
-            )
-            baseline_metrics = baseline_result.metrics
-        else:
-            baseline_metrics = _baseline_metrics
-        
-        # Simulate quantization improvements
-        # Quantization typically reduces model size by 50-75% and improves inference speed
-        quant_metrics = BenchmarkMetrics(
-            response_time=baseline_metrics.response_time * 0.6,  # 40% faster
-            memory_usage_mb=baseline_metrics.memory_usage_mb * 0.5,  # 50% less memory
-            cpu_usage_percent=baseline_metrics.cpu_usage_percent * 0.7,  # 30% less CPU
-            tokens_per_second=baseline_metrics.tokens_per_second * 1.5,  # 50% faster throughput
-            model_size_mb=baseline_metrics.model_size_mb * 0.4 if baseline_metrics.model_size_mb else None,  # 60% smaller
-            latency_p50=baseline_metrics.latency_p50 * 0.6 if baseline_metrics.latency_p50 else None,
-            latency_p95=baseline_metrics.latency_p95 * 0.65 if baseline_metrics.latency_p95 else None,
-            latency_p99=baseline_metrics.latency_p99 * 0.7 if baseline_metrics.latency_p99 else None,
+
+        baseline_result = _optimizer.benchmark_model(
+            model_name=BASE_MODEL_NAME,
+            query_func=baseline_query,
+            test_queries=[question],
+            technique="baseline",
         )
-        
+        baseline_metrics = baseline_result.metrics
+
+        # Quantized model: real benchmark on quantized model
+        quant_model = get_model(quant_model_name)
+
+        def quant_query(q: str):
+            answer, _ = query_rag(question, db, quant_model)
+            return answer
+
+        quant_result = _optimizer.benchmark_model(
+            model_name=quant_model_name,
+            query_func=quant_query,
+            test_queries=[question],
+            technique="quantization",
+        )
+        quant_metrics = quant_result.metrics
+
         improvements = _optimizer.calculate_improvement(baseline_metrics, quant_metrics)
-        
+
         return {
             "technique": "quantization",
             "quantization_level": quantization_level,
-            "model_name": f"mistral-{quantization_level}",
+            "model_name": quant_model_name,
             "metrics": {
                 "response_time": quant_metrics.response_time,
                 "memory_usage_mb": quant_metrics.memory_usage_mb,
@@ -334,40 +379,60 @@ async def benchmark_quantization(request: OptimizationRequest):
 
 @app.post("/api/benchmark/pruning")
 async def benchmark_pruning(request: OptimizationRequest):
-    """Run pruning benchmark."""
+    """Run pruning benchmark using a real pruned / smaller model if available."""
     if request.technique != "pruning":
         raise HTTPException(status_code=400, detail="Technique must be 'pruning'")
     
     try:
+        # Determine question
+        question = (request.question or "What is autism?").strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Question for benchmark cannot be empty")
+
         db = get_db()
         pruning_ratio = request.pruning_ratio or 0.3
-        model = get_model("mistral")
-        
-        def query_func(q: str):
-            answer, _ = query_rag(q, db, model)
+        # Baseline benchmark on base model
+        base_model = get_model(BASE_MODEL_NAME)
+
+        def baseline_query(q: str):
+            answer, _ = query_rag(question, db, base_model)
             return answer
-        
-        # Get baseline if not already set
-        if _baseline_metrics is None:
-            baseline_result = _optimizer.benchmark_model(
-                model_name="mistral",
-                query_func=query_func,
-                test_queries=["What is autism?"],
-                technique="baseline"
-            )
-            baseline_metrics = baseline_result.metrics
+
+        baseline_result = _optimizer.benchmark_model(
+            model_name=BASE_MODEL_NAME,
+            query_func=baseline_query,
+            test_queries=[question],
+            technique="baseline",
+        )
+        baseline_metrics = baseline_result.metrics
+
+        # Determine pruned model name
+        if PRUNED_MODEL_NAME:
+            pruned_model_name = PRUNED_MODEL_NAME
         else:
-            baseline_metrics = _baseline_metrics
-        
-        # Simulate pruning
-        pruned_metrics = _optimizer.simulate_pruning(baseline_metrics, pruning_ratio)
-        
+            # Fallback: construct a name; user must ensure this model exists in Ollama
+            pruned_model_name = f"{BASE_MODEL_NAME}-pruned-{int(pruning_ratio * 100)}"
+
+        pruned_model = get_model(pruned_model_name)
+
+        def pruned_query(q: str):
+            answer, _ = query_rag(question, db, pruned_model)
+            return answer
+
+        pruned_result = _optimizer.benchmark_model(
+            model_name=pruned_model_name,
+            query_func=pruned_query,
+            test_queries=[question],
+            technique="pruning",
+        )
+        pruned_metrics = pruned_result.metrics
+
         improvements = _optimizer.calculate_improvement(baseline_metrics, pruned_metrics)
-        
+
         return {
             "technique": "pruning",
             "pruning_ratio": pruning_ratio,
-            "model_name": f"mistral-pruned-{int(pruning_ratio * 100)}%",
+            "model_name": pruned_result.model_name,
             "metrics": {
                 "response_time": pruned_metrics.response_time,
                 "memory_usage_mb": pruned_metrics.memory_usage_mb,

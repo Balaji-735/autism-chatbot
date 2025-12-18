@@ -27,17 +27,13 @@ export interface BenchmarkResponse {
   pruning_ratio?: number;
 }
 
-export interface BaselineRequest {
-  test_queries?: string[];
-}
-
-export async function runBaselineBenchmark(request?: BaselineRequest): Promise<BenchmarkResponse> {
+export async function runBaselineBenchmark(question: string): Promise<BenchmarkResponse> {
   const response = await fetch(`${API_BASE_URL}/api/benchmark/baseline`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify(request || {}),
+    body: JSON.stringify({ question }),
   });
 
   if (!response.ok) {
@@ -54,7 +50,8 @@ export async function runBaselineBenchmark(request?: BaselineRequest): Promise<B
 }
 
 export async function runQuantizationBenchmark(
-  quantizationLevel: string = 'q4_0'
+  quantizationLevel: string = 'q4_0',
+  question: string,
 ): Promise<BenchmarkResponse> {
   const response = await fetch(`${API_BASE_URL}/api/benchmark/quantization`, {
     method: 'POST',
@@ -64,6 +61,7 @@ export async function runQuantizationBenchmark(
     body: JSON.stringify({
       technique: 'quantization',
       quantization_level: quantizationLevel,
+      question,
     }),
   });
 
@@ -76,7 +74,8 @@ export async function runQuantizationBenchmark(
 }
 
 export async function runPruningBenchmark(
-  pruningRatio: number = 0.3
+  pruningRatio: number = 0.3,
+  question: string,
 ): Promise<BenchmarkResponse> {
   const response = await fetch(`${API_BASE_URL}/api/benchmark/pruning`, {
     method: 'POST',
@@ -86,6 +85,7 @@ export async function runPruningBenchmark(
     body: JSON.stringify({
       technique: 'pruning',
       pruning_ratio: pruningRatio,
+      question,
     }),
   });
 
@@ -104,5 +104,7 @@ export async function getBenchmarkHistory() {
   }
   return response.json();
 }
+
+
 
 

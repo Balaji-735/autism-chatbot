@@ -78,3 +78,5 @@ frontend/
 The frontend communicates with the FastAPI backend at `/api/query` endpoint. Make sure the backend server is running before starting the frontend.
 
 
+
+

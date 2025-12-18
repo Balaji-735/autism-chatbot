@@ -32,22 +32,27 @@ interface ComparisonData {
   pruningImprovements?: Record<string, number>
 }
 
-export function OptimizationDashboard() {
+export function OptimizationDashboard({ currentQuestion }: { currentQuestion: string | null }) {
   const [loading, setLoading] = useState<string | null>(null)
   const [comparisonData, setComparisonData] = useState<ComparisonData>({})
   const [quantizationLevel, setQuantizationLevel] = useState("q4_0")
   const [pruningRatio, setPruningRatio] = useState(0.3)
 
   const runBenchmark = async (type: 'baseline' | 'quantization' | 'pruning') => {
+    if (!currentQuestion || !currentQuestion.trim()) {
+      alert("Ask a question in the chatbot first, then run the benchmark on that question.")
+      return
+    }
+
     setLoading(type)
     try {
       let result: BenchmarkResponse
       
       if (type === 'baseline') {
-        result = await runBaselineBenchmark()
+        result = await runBaselineBenchmark(currentQuestion)
         setComparisonData(prev => ({ ...prev, baseline: result.metrics }))
       } else if (type === 'quantization') {
-        result = await runQuantizationBenchmark(quantizationLevel)
+        result = await runQuantizationBenchmark(quantizationLevel, currentQuestion)
         setComparisonData(prev => ({
           ...prev,
           quantization: result.metrics,
@@ -55,7 +60,7 @@ export function OptimizationDashboard() {
           quantizationImprovements: result.improvements
         }))
       } else {
-        result = await runPruningBenchmark(pruningRatio)
+        result = await runPruningBenchmark(pruningRatio, currentQuestion)
         setComparisonData(prev => ({
           ...prev,
           pruning: result.metrics,
@@ -184,7 +189,7 @@ export function OptimizationDashboard() {
             Optimization Dashboard
           </CardTitle>
           <CardDescription>
-            Benchmark and compare model optimization techniques
+            Benchmark and compare model optimization techniques on the current chat question
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -257,10 +262,11 @@ export function OptimizationDashboard() {
                     onChange={(e) => setQuantizationLevel(e.target.value)}
                     className="text-xs border rounded px-2 py-1"
                     disabled={loading !== null}
+                    title="Q4_0: llama3.2:1b (1.3GB), Q5_0: llama3.2:3b (2GB), Q8_0: gemma:2b (1.7GB)"
                   >
-                    <option value="q4_0">Q4_0</option>
-                    <option value="q5_0">Q5_0</option>
-                    <option value="q8_0">Q8_0</option>
+                    <option value="q4_0">Q4_0 (llama3.2:1b)</option>
+                    <option value="q5_0">Q5_0 (llama3.2:3b)</option>
+                    <option value="q8_0">Q8_0 (gemma:2b)</option>
                   </select>
                   <Button
                     size="sm"
@@ -337,5 +343,7 @@ export function OptimizationDashboard() {
     </div>
   )
 }
+
+
 
 
